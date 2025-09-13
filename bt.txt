@@ -1,0 +1,233 @@
+# /root/tg_inpaint_bot/bot.py
+import os
+import io
+import json
+import time
+import base64
+import logging
+from uuid import uuid4
+from typing import Tuple
+
+import aiohttp
+from dotenv import load_dotenv
+from PIL import Image
+from aiogram import Bot, Dispatcher, types
+from aiogram.types.message import ContentType
+from aiogram.utils import executor
+from urllib.parse import quote
+
+# ------------------- конфиг -------------------
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+STABILITY_API_KEY = os.getenv("STABILITY_API_KEY", "")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://funfishinggame.store").rstrip("/")
+PORT = int(os.getenv("PORT", "8000"))
+
+if not BOT_TOKEN or not STABILITY_API_KEY:
+    raise SystemExit("BOT_TOKEN и/или STABILITY_API_KEY не заданы в .env")
+
+# Хранилище под доменом (same-origin для WebApp)
+UPLOAD_DIR = "/var/www/funfishinggame.store/html/uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("inpaintbot")
+
+bot = Bot(BOT_TOKEN, parse_mode=None)
+dp = Dispatcher(bot)
+
+# Последняя картинка на пользователя (для повторного открытия кисти)
+LAST_IMAGE_URL: dict[int, str] = {}
+
+# ------------------- утилиты -------------------
+async def download_bytes(url: str) -> bytes:
+    async with aiohttp.ClientSession() as sess:
+        async with sess.get(url) as r:
+            r.raise_for_status()
+            return await r.read()
+
+async def save_tg_file_to_uploads(file_id: str) -> tuple[str, str]:
+    """
+    Скачиваем файл из Telegram и кладём его в /uploads.
+    Возвращаем (local_path, public_url).
+    """
+    f = await bot.get_file(file_id)
+    tg_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}"
+
+    ext = os.path.splitext(f.file_path)[1].lower() or ".jpg"
+    name = f"{int(time.time())}_{uuid4().hex}{ext}"
+    local_path = os.path.join(UPLOAD_DIR, name)
+
+    data = await download_bytes(tg_url)
+
+    # Перекод webp -> png (если прилетело webp)
+    if ext == ".webp":
+        try:
+            im = Image.open(io.BytesIO(data)).convert("RGB")
+            buf = io.BytesIO()
+            im.save(buf, format="PNG")
+            data = buf.getvalue()
+            name = name.rsplit(".", 1)[0] + ".png"
+            local_path = os.path.join(UPLOAD_DIR, name)
+        except Exception:
+            pass
+
+    with open(local_path, "wb") as out:
+        out.write(data)
+
+    public_url = f"{PUBLIC_BASE_URL}/uploads/{name}"
+    return local_path, public_url
+
+def _unpack_bitmask_to_L(b64: str, w: int, h: int) -> Image.Image:
+    """
+    Из компактной битовой маски (MSB-first) делаем Pillow 'L' (0/255).
+    """
+    raw = base64.b64decode(b64)
+    total = w * h
+    out = bytearray(total)
+    idx = 0
+    for b in raw:
+        for bit in range(7, -1, -1):
+            if idx >= total:
+                break
+            out[idx] = 255 if ((b >> bit) & 1) else 0
+            idx += 1
+        if idx >= total:
+            break
+    return Image.frombytes("L", (w, h), bytes(out))
+
+def _build_fullsize_mask(nat_w: int, nat_h: int, bbox: Tuple[int, int, int, int], small_mask: Image.Image) -> Image.Image:
+    """
+    Разворачиваем маленькую маску в полноразмерную 'L' (нативный размер изображения).
+    bbox = (x, y, w, h) — координаты в натуральных пикселях.
+    """
+    x, y, w, h = bbox
+    mask_full = Image.new("L", (nat_w, nat_h), 0)
+    if w > 0 and h > 0:
+        m = small_mask.resize((w, h), Image.NEAREST)
+        mask_full.paste(m, (x, y))
+    return mask_full
+
+async def call_stability_inpaint(image_bytes: bytes, mask_png: bytes, prompt: str) -> bytes:
+    """
+    Вызов Stability Inpaint. ОБЯЗАТЕЛЬНО шлём Accept: image/*.
+    """
+    url = "https://api.stability.ai/v2beta/stable-image/edit/inpaint"
+    headers = {
+        "Authorization": f"Bearer {STABILITY_API_KEY}",
+        "Accept": "image/*",  # <— это лечит ошибку «accept: expected image/*, but received */*»
+    }
+
+    form = aiohttp.FormData()
+    form.add_field("image", image_bytes, filename="image.png", content_type="image/png")
+    form.add_field("mask",  mask_png,   filename="mask.png",  content_type="image/png")
+    if (prompt or "").strip():
+        form.add_field("prompt", prompt.strip())
+    form.add_field("output_format", "png")
+
+    async with aiohttp.ClientSession() as sess:
+        async with sess.post(url, headers=headers, data=form, timeout=180) as resp:
+            if resp.status != 200:
+                txt = await resp.text()
+                raise RuntimeError(f"Stability API error: {resp.status} {txt}")
+            return await resp.read()
+
+# ------------------- хендлеры -------------------
+@dp.message_handler(commands=["start"])
+async def start_cmd(m: types.Message):
+    await m.answer(
+        "Привет! Пришли фото (как фото или документ). Я верну картинку с инпейнтом.\n\n"
+        "После загрузки жми кнопку «🖌 Открыть кисть».",
+    )
+
+def webapp_button(url: str) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🖌 Открыть кисть", web_app=types.WebAppInfo(url=url)))
+    return kb
+
+@dp.message_handler(content_types=[ContentType.PHOTO, ContentType.DOCUMENT])
+async def got_image(m: types.Message):
+    """
+    Принимаем фото/документ -> сохраняем в /uploads -> даём кнопку WebApp.
+    """
+    if m.content_type == ContentType.PHOTO:
+        file_id = m.photo[-1].file_id
+    else:
+        if not (m.document.mime_type and m.document.mime_type.startswith("image/")):
+            await m.reply("Пришли изображение в виде фото или документа.")
+            return
+        file_id = m.document.file_id
+
+    local_path, public_url = await save_tg_file_to_uploads(file_id)
+    LAST_IMAGE_URL[m.chat.id] = public_url
+    log.info("Saved: %s -> %s", local_path, public_url)
+
+    # cache-bust и полное URL-кодирование параметра img
+    ver = int(time.time())
+    wa_url = f"{PUBLIC_BASE_URL}/index.html?v={ver}&img={quote(public_url, safe='')}"
+
+    await m.answer(
+        "Изображение загружено. Жми «🖌 Открыть кисть».",
+        reply_markup=webapp_button(wa_url)
+    )
+
+@dp.message_handler(content_types=ContentType.WEB_APP_DATA)
+async def webapp_data(m: types.Message):
+    """
+    Получаем из WebApp компактную маску, bbox и исходный img URL,
+    собираем полноразмерную маску -> Stability -> отдаём результат.
+    """
+    try:
+        data = json.loads(m.web_app_data.data)
+    except Exception:
+        await m.reply("Не смог прочитать данные из WebApp :(")
+        return
+
+    img_url = data.get("img") or LAST_IMAGE_URL.get(m.chat.id)
+    prompt = (data.get("prompt") or "").strip()
+    nat_w = int(data.get("nat_w") or 0)
+    nat_h = int(data.get("nat_h") or 0)
+    bm_w  = int(data.get("bm_w")  or 0)
+    bm_h  = int(data.get("bm_h")  or 0)
+    bbox  = data.get("bbox") or [0, 0, 0, 0]
+    bitmask_b64 = data.get("bitmask")
+
+    if not img_url or not bitmask_b64 or not nat_w or not nat_h or not bm_w or not bm_h:
+        await m.reply("Похоже, маска или параметры не пришли. Попробуй ещё раз.")
+        return
+
+    # маленькая маска -> полноразмерная L-маска
+    small_mask = _unpack_bitmask_to_L(bitmask_b64, bm_w, bm_h)
+    mask_full  = _build_fullsize_mask(nat_w, nat_h, tuple(map(int, bbox)), small_mask)
+
+    bio = io.BytesIO()
+    mask_full.save(bio, format="PNG")
+    mask_bytes = bio.getvalue()
+
+    status = await m.reply("Маска получена. Генерирую результат…")
+    try:
+        # если картинка из нашего /uploads — читаем локально (быстрее и надёжнее)
+        image_bytes: bytes
+        prefix = f"{PUBLIC_BASE_URL}/uploads/"
+        if img_url.startswith(prefix):
+            name = img_url.split("/uploads/")[-1].split("?")[0]
+            local_path = os.path.join(UPLOAD_DIR, name)
+            with open(local_path, "rb") as f:
+                image_bytes = f.read()
+        else:
+            image_bytes = await download_bytes(img_url)
+
+        result_png = await call_stability_inpaint(image_bytes, mask_bytes, prompt or "inpaint")
+    except Exception as e:
+        log.exception("Inpaint failed")
+        await status.edit_text(f"Ошибка: {e}")
+        return
+
+    await status.delete()
+    await m.reply_photo(types.InputFile(io.BytesIO(result_png), filename="result.png"), caption="Готово ✨")
+
+# ------------------- запуск -------------------
+if __name__ == "__main__":
+    log.info("Bot: InpaintBot start")
+    executor.start_polling(dp, skip_updates=True)

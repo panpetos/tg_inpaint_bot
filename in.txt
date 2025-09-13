@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
+  />
+  <title>InpaintBot</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root { --bg:#0f1620; --panel:#0d1b2a; --text:#e6edf3; --muted:#9aa4af; --ok:#16a34a; --danger:#ef4444; --btn:#1f2937; }
+    html,body { height:100%; margin:0; font-family:system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial; color:var(--text); background:var(--bg);}
+    .wrap { max-width:940px; margin:24px auto; padding:0 16px; }
+    .card { background:var(--panel); border-radius:14px; padding:16px; box-shadow:0 6px 24px rgba(0,0,0,.35);}
+    h1 { margin:0 0 12px 0; font-size:20px; }
+    .frame { position:relative; width:100%; aspect-ratio: 16 / 9; background:#0a0f17; border-radius:12px; overflow:hidden; }
+    canvas { position:absolute; inset:0; width:100%; height:100%; display:block; }
+    /* imgCanvas снизу, paintCanvas сверху */
+    #imgCanvas { z-index:1; background:#000; }
+    #paintCanvas { z-index:2; }
+    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:12px;}
+    .pill { background:var(--btn); border-radius:10px; padding:8px 10px; display:inline-flex; align-items:center; gap:8px;}
+    input[type="range"] { width:240px; }
+    .btn { border:0; border-radius:10px; padding:10px 14px; font-weight:600; cursor:pointer; color:#fff; background:#374151; }
+    .btn.active { background:#2563eb; }
+    .btn.red { background:var(--danger); }
+    .btn.green { background:var(--ok); width:100%; font-size:16px; padding:14px; }
+    .muted { color:var(--muted); font-size:13px; }
+    .prompt { width:100%; padding:10px 12px; background:#0b1220; color:var(--text); border-radius:10px; border:1px solid #1f2a37; outline:none;}
+    .toast { position:fixed; left:50%; bottom:18px; transform:translateX(-50%); background:#111827; color:#fff; padding:10px 14px; border-radius:10px; box-shadow:0 10px 24px rgba(0,0,0,.35); display:none;}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>InpaintBot</h1>
+
+    <div class="frame">
+      <canvas id="imgCanvas"></canvas>
+      <canvas id="paintCanvas"></canvas>
+    </div>
+
+    <div class="row">
+      <div class="pill">
+        Кисть:&nbsp;<input id="brush" type="range" min="5" max="200" value="35" />&nbsp;<span id="bval">35</span>&nbsp;px
+      </div>
+      <button id="modeBrush" class="btn active">Кисть</button>
+      <button id="modeEraser" class="btn">Ластик</button>
+      <button id="clearBtn" class="btn red">Очистить</button>
+    </div>
+
+    <div class="row">
+      <input id="prompt" class="prompt" placeholder="Подсказка (prompt), напр.: заменить на затонированное окно" />
+    </div>
+
+    <div class="row">
+      <button id="sendBtn" class="btn green">Отправить в бота</button>
+    </div>
+
+    <p class="muted">Белым цветом пометь области, которые нужно изменить. Чёрным — без изменений.</p>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+(function(){
+  const tg = window.Telegram?.WebApp;
+  try { tg && tg.expand && tg.expand(); } catch(e) {}
+
+  const qs = new URLSearchParams(location.search);
+  const IMG_URL = qs.get('img');
+
+  const imgC  = document.getElementById('imgCanvas');
+  const maskC = document.getElementById('paintCanvas');
+  const imgX  = imgC.getContext('2d');
+  const maskX = maskC.getContext('2d');
+
+  // offscreen маска в НАТИВНОМ размере изображения
+  let natW = 0, natH = 0;
+  const offMaskC = document.createElement('canvas');
+  const offMaskX = offMaskC.getContext('2d', {willReadFrequently:true});
+
+  // где картинка отображается в видимом холсте (с отступами)
+  let viewW=0, viewH=0, viewX=0, viewY=0, scale=1;
+
+  // UI
+  const brush = document.getElementById('brush');
+  const bval  = document.getElementById('bval');
+  const btnBrush  = document.getElementById('modeBrush');
+  const btnEraser = document.getElementById('modeEraser');
+  const btnClear  = document.getElementById('clearBtn');
+  const btnSend   = document.getElementById('sendBtn');
+  const inpPrompt = document.getElementById('prompt');
+  const toastEl   = document.getElementById('toast');
+
+  let drawMode = 'brush'; // 'brush' | 'eraser'
+  let drawing = false, lastX = 0, lastY = 0;
+
+  function showToast(msg, ms=2200) {
+    toastEl.textContent = msg;
+    toastEl.style.display = 'block';
+    clearTimeout(showToast._t);
+    showToast._t = setTimeout(()=>toastEl.style.display='none', ms);
+  }
+
+  function fitCanvases(){
+    const rect = imgC.parentElement.getBoundingClientRect();
+    imgC.width = maskC.width = Math.max(1, Math.round(rect.width));
+    imgC.height = maskC.height = Math.max(1, Math.round(rect.height));
+
+    // letterbox
+    const s = Math.min(rect.width / natW, rect.height / natH);
+    viewW = Math.round(natW * s);
+    viewH = Math.round(natH * s);
+    viewX = Math.floor((rect.width - viewW) / 2);
+    viewY = Math.floor((rect.height - viewH) / 2);
+    scale = s;
+
+    renderAll();
+  }
+
+  function renderAll(){
+    // фон
+    imgX.clearRect(0,0,imgC.width,imgC.height);
+    if (imageEl.complete) {
+      imgX.drawImage(imageEl, viewX, viewY, viewW, viewH);
+    }
+    // превью маски: только участки, где белое — белой вуалью, а не чёрный прямоугольник
+    redrawPreviewFromOffMask();
+  }
+
+  function redrawPreviewFromOffMask(){
+    maskX.clearRect(0,0,maskC.width, maskC.height);
+
+    const src = offMaskX.getImageData(0,0,natW,natH);
+    const d = src.data;
+    // конвертируем в белую вуаль (RGBA), где есть белые штрихи, остальное прозрачное
+    for (let i=0; i<d.length; i+=4){
+      const r=d[i], g=d[i+1], b=d[i+2];
+      const isWhite = (r>10 || g>10 || b>10);
+      d[i] = 255; d[i+1]=255; d[i+2]=255; d[i+3] = isWhite ? 90 : 0; // 90/255 ≈ 0.35
+    }
+    const tmpC = document.createElement('canvas');
+    tmpC.width = natW; tmpC.height = natH;
+    tmpC.getContext('2d').putImageData(src, 0, 0);
+    maskX.drawImage(tmpC, viewX, viewY, viewW, viewH);
+  }
+
+  function setMode(mode){
+    drawMode = mode;
+    if(mode === 'brush'){ btnBrush.classList.add('active'); btnEraser.classList.remove('active'); }
+    else { btnEraser.classList.add('active'); btnBrush.classList.remove('active'); }
+  }
+
+  function toNatCoords(clientX, clientY){
+    const r = maskC.getBoundingClientRect();
+    const x = clientX - r.left, y = clientY - r.top;
+    if (x < viewX || y < viewY || x > viewX+viewW || y > viewY+viewH) return null; // вне картинки
+    const nx = (x - viewX) / scale;
+    const ny = (y - viewY) / scale;
+    return {x: nx, y: ny};
+  }
+
+  function drawDotNat(ctx, x, y, r, color){
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  function drawLineNat(ctx, x1,y1, x2,y2, r, color){
+    ctx.strokeStyle = color;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = r*2;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+  }
+
+  function drawPreviewDot(x, y, r, color){
+    if (color === '#ffffff'){
+      maskX.fillStyle = 'rgba(255,255,255,0.35)';
+      maskX.beginPath();
+      maskX.arc(viewX + x*scale, viewY + y*scale, r*scale, 0, Math.PI*2);
+      maskX.fill();
+    } else {
+      // ластик не подкрашивает превью — просто перерисуем целиком из offMask
+      redrawPreviewFromOffMask();
+    }
+  }
+
+  function drawPreviewLine(x1,y1, x2,y2, r, color){
+    if (color === '#ffffff'){
+      maskX.strokeStyle = 'rgba(255,255,255,0.35)';
+      maskX.lineCap = 'round';
+      maskX.lineJoin = 'round';
+      maskX.lineWidth = r*2*scale;
+      maskX.beginPath();
+      maskX.moveTo(viewX + x1*scale, viewY + y1*scale);
+      maskX.lineTo(viewX + x2*scale, viewY + y2*scale);
+      maskX.stroke();
+    } else {
+      redrawPreviewFromOffMask();
+    }
+  }
+
+  function clearMask(){
+    offMaskC.width = natW; offMaskC.height = natH; // сброс контекста
+    offMaskX.fillStyle = '#000000';
+    offMaskX.fillRect(0,0,natW,natH);
+    redrawPreviewFromOffMask();
+  }
+
+  // Сборка компактной битовой маски; targetBytes — приблизительный бюджет
+  function buildBitmaskAdaptive(targetBytes=3500){
+    const imgData = offMaskX.getImageData(0,0,natW,natH);
+    const d = imgData.data;
+
+    // bbox
+    let minX = natW, minY = natH, maxX = -1, maxY = -1;
+    for (let y=0; y<natH; y++){
+      const row = y*natW*4;
+      for (let x=0; x<natW; x++){
+        const i = row + x*4;
+        if (d[i] > 10 || d[i+1] > 10 || d[i+2] > 10){ // есть белое
+          if (x<minX) minX=x; if (x>maxX) maxX=x;
+          if (y<minY) minY=y; if (y>maxY) maxY=y;
+        }
+      }
+    }
+    if (maxX < minX || maxY < minY) return null; // пусто
+
+    const bw = maxX - minX + 1;
+    const bh = maxY - minY + 1;
+
+    // вырезаем bbox в offscreen
+    const cropC = document.createElement('canvas');
+    cropC.width = bw; cropC.height = bh;
+    cropC.getContext('2d').drawImage(offMaskC, minX, minY, bw, bh, 0, 0, bw, bh);
+
+    let sw = bw, sh = bh, scaleK = 1;
+
+    // уменьшаем пока битмаска не влезет в бюджет
+    while (Math.ceil(sw*sh/8) > targetBytes) {
+      scaleK *= 1.25;
+      sw = Math.max(1, Math.round(bw/scaleK));
+      sh = Math.max(1, Math.round(bh/scaleK));
+      if (sw*sh <= 1) break;
+    }
+
+    const smallC = document.createElement('canvas');
+    smallC.width = sw; smallC.height = sh;
+    const sctx = smallC.getContext('2d', {willReadFrequently:true});
+    sctx.imageSmoothingEnabled = false;
+    sctx.drawImage(cropC, 0,0,bw,bh, 0,0,sw,sh);
+
+    // в битмаску (MSB-first)
+    const sd = sctx.getImageData(0,0,sw,sh).data;
+    const total = sw*sh;
+    const bytes = new Uint8Array(Math.ceil(total/8));
+    let bitIndex = 0, byteIndex = 0, cur = 0;
+
+    for (let i=0; i<total; i++){
+      const j = i*4;
+      const white = (sd[j] > 10 || sd[j+1] > 10 || sd[j+2] > 10) ? 1 : 0;
+      cur = (cur << 1) | white; // MSB-first
+      bitIndex++;
+      if (bitIndex === 8){
+        bytes[byteIndex++] = cur;
+        bitIndex = 0; cur = 0;
+      }
+    }
+    if (bitIndex > 0){
+      cur = cur << (8 - bitIndex);
+      bytes[byteIndex++] = cur;
+    }
+
+    return {
+      bitmask: btoa(String.fromCharCode(...bytes)),
+      bm_w: sw,
+      bm_h: sh,
+      bbox: [minX, minY, bw, bh]
+    };
+  }
+
+  // События рисования
+  function startDraw(ev){
+    const p = getPoint(ev);
+    const nat = toNatCoords(p.x, p.y);
+    if(!nat) return;
+    drawing = true; lastX = nat.x; lastY = nat.y;
+    const r = +brush.value;
+    const color = (drawMode==='brush') ? '#ffffff' : '#000000';
+    drawDotNat(offMaskX, nat.x, nat.y, r, color);
+    drawPreviewDot(nat.x, nat.y, r, color);
+  }
+  function moveDraw(ev){
+    if(!drawing) return;
+    const p = getPoint(ev);
+    const nat = toNatCoords(p.x, p.y);
+    if(!nat) return;
+    const r = +brush.value;
+    const color = (drawMode==='brush') ? '#ffffff' : '#000000';
+    drawLineNat(offMaskX, lastX,lastY, nat.x,nat.y, r, color);
+    drawPreviewLine(lastX,lastY, nat.x,nat.y, r, color);
+    lastX = nat.x; lastY = nat.y;
+  }
+  function endDraw(){ drawing = false; }
+
+  function getPoint(ev){
+    if (ev.touches && ev.touches[0]) return {x: ev.touches[0].clientX, y: ev.touches[0].clientY};
+    return {x: ev.clientX, y: ev.clientY};
+  }
+
+  // UI handlers
+  brush.addEventListener('input', ()=> bval.textContent = brush.value);
+  btnBrush.addEventListener('click', ()=> setMode('brush'));
+  btnEraser.addEventListener('click', ()=> setMode('eraser'));
+  btnClear.addEventListener('click', ()=> { clearMask(); });
+
+  // отправка
+  btnSend.addEventListener('click', ()=>{
+    if (!natW || !natH){ showToast('Картинка ещё не загрузилась'); return; }
+    let packed = buildBitmaskAdaptive(2600);
+    if (!packed){ showToast('Маска пустая. Зарисуйте область белым.'); return; }
+
+    let payload = {
+      img: IMG_URL, prompt: (inpPrompt.value||'').trim(),
+      nat_w: natW, nat_h: natH,
+      bm_w: packed.bm_w, bm_h: packed.bm_h,
+      bbox: packed.bbox, bitmask: packed.bitmask
+    };
+    let s = JSON.stringify(payload);
+
+    if (s.length > 3900) {
+      // ещё ужмём маску
+      packed = buildBitmaskAdaptive(2000);
+      payload.bm_w = packed.bm_w; payload.bm_h = packed.bm_h;
+      payload.bbox = packed.bbox; payload.bitmask = packed.bitmask;
+      s = JSON.stringify(payload);
+    }
+    if (s.length > 4096) { showToast('Слишком большая маска — уменьшите область.'); return; }
+
+    try {
+      tg?.sendData(s);
+      showToast('Отправлено боту (' + s.length + ' B). Ждите ответ в чате…');
+      // НЕ закрываем WebApp автоматически — гарантируем доставку
+      // tg.close();
+    } catch(e){
+      console.error(e);
+      showToast('Не удалось передать данные. Откройте кисть через кнопку в чате.');
+    }
+  });
+
+  // загрузка изображения
+  if (!IMG_URL){
+    showToast('Не передан параметр ?img=…'); 
+  }
+
+  const imageEl = new Image();
+  imageEl.crossOrigin = 'anonymous';
+  imageEl.onload = ()=>{
+    natW = imageEl.naturalWidth || imageEl.width;
+    natH = imageEl.naturalHeight || imageEl.height;
+    offMaskC.width = natW; offMaskC.height = natH;
+    clearMask();
+    fitCanvases();
+  };
+  imageEl.onerror = ()=>{
+    showToast('Не удалось загрузить изображение для кисти.');
+  };
+  imageEl.src = IMG_URL;
+
+  // ресайз
+  window.addEventListener('resize', ()=>{ if(natW&&natH) fitCanvases(); });
+
+  // рисование (мышь/тач)
+  maskC.addEventListener('mousedown', startDraw);
+  maskC.addEventListener('mousemove', moveDraw);
+  window.addEventListener('mouseup', endDraw);
+
+  maskC.addEventListener('touchstart', (e)=>{ e.preventDefault(); startDraw(e); }, {passive:false});
+  maskC.addEventListener('touchmove',  (e)=>{ e.preventDefault(); moveDraw(e); },  {passive:false});
+  maskC.addEventListener('touchend',   (e)=>{ e.preventDefault(); endDraw(e); },   {passive:false});
+})();
+</script>
+</body>
+</html>
