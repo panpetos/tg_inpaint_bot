@@ -1,11 +1,27 @@
+# Python / общие артефакты
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.log
+*.sqlite3
+
+# Виртуальные окружения / локалки
 .venv/
 venv/
 .env
+.env.*
+
+# IDE / ОС
 .DS_Store
 .idea/
 .vscode/
+
+# Сборки / кэш
 build/
 dist/
 .pytest_cache/
+.cache/
+.mypy_cache/
+.coverage
+htmlcov/
